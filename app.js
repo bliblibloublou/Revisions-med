@@ -1,6 +1,7 @@
 /* ============================================================
-   RÉVISIONS MÉDECINE v3.1
-   0 donnée hardcodée · IndexedDB · Leitner · Barème EDN
+   RÉVISIONS MÉDECINE v3.4
+   Consolidé : base v3.1 + couche EDN + ajouts
+   Zéro donnée hardcodée · IndexedDB · Leitner · Barème SIDES/EDN
    ============================================================ */
 
 const DB_NAME = 'revisionMed_v3';
@@ -8,8 +9,10 @@ const DB_VERSION = 1;
 const LEITNER_DAYS = [0, 1, 3, 7, 16];
 const STATUTS = ['générée', 'à_vérifier', 'validée', 'à_corriger', 'archivée'];
 const Q_TYPES = ['QCM', 'QRM', 'QRU', 'QROC', 'KFP'];
+const RANGS = ['A', 'B', 'C'];
 const MATIERE_COLORS = ['#0066cc','#18794e','#c98f0a','#7c3aed','#b83030','#0891b2','#db2777','#059669'];
 const BACKUP_WARN_MS = 7 * 86400000;
+const DAILY_GOAL_DEFAULT = 20;
 
 const State = {
   matieres: [], cours: [], questions: [], history: [], config: {},
@@ -82,9 +85,7 @@ function stripMarkdownFences(text){
   return t;
 }
 function normalizeCurlyQuotes(text){
-  return text
-    .replace(/[\u201C\u201D\u201E\u2033]/g, '"')
-    .replace(/[\u2018\u2019\u201A\u2032]/g, "'");
+  return text.replace(/[\u201C\u201D\u201E\u2033]/g, '"').replace(/[\u2018\u2019\u201A\u2032]/g, "'");
 }
 function parseJSONRobust(raw){
   const cleaned = stripMarkdownFences(raw);
@@ -126,7 +127,7 @@ function statutColor(s){
 function statutLabel(s){ return s.replace(/_/g,' '); }
 function pct(n,d){ return d ? Math.round(100*n/d) : 0; }
 
-/* Barème EDN */
+/* Barème SIDES/EDN — discordances */
 function getDiscordances(q, ans){
   if(['QROC','KFP'].includes(q.type)) return null;
   const a = Array.isArray(ans) ? ans : [];
@@ -166,6 +167,36 @@ function isLeitnerCorrect(q, ans){
   return getDiscordances(q, ans).discordances===0;
 }
 
+/* Streak / objectif */
+function computeStreak(){
+  const days = new Set(State.history.map(h=>h.date.slice(0,10)));
+  if(!days.size) return 0;
+  let streak = 0;
+  const d = new Date();
+  for(let i=0;i<365;i++){
+    const key = d.toISOString().slice(0,10);
+    if(days.has(key)) streak++;
+    else if(i>0) break;
+    d.setDate(d.getDate()-1);
+  }
+  return streak;
+}
+function todayAttempts(){
+  const today = todayStr();
+  return State.history.filter(h=>h.date.slice(0,10)===today).reduce((n,h)=>n+(h.qcmTotal||0),0);
+}
+function forecast(days=7){
+  const out = [];
+  const now = new Date();
+  for(let i=0;i<days;i++){
+    const d = new Date(now);
+    d.setDate(d.getDate()+i);
+    const key = d.toISOString().slice(0,10);
+    out.push({date:key, count:State.questions.filter(q=>q.nextReview && q.nextReview.slice(0,10)===key && q.statut!=='archivée').length});
+  }
+  return out;
+}
+
 /* ============ CHARGEMENT ============ */
 async function loadAll(){
   State.matieres = await dbAll('matieres');
@@ -192,9 +223,16 @@ function showView(id){
   if(id==='stats') renderStats();
   if(id==='settings') renderSettings();
   renderBackupBanner();
+  syncFull();
   window.scrollTo({top:0,behavior:'smooth'});
 }
 $$('.tabbar button').forEach(b=>b.addEventListener('click', ()=>showView(b.dataset.view)));
+
+function syncFull(){
+  const a = document.getElementById('sessionArea');
+  const on = !!(State.view==='train' && State.session && a && a.innerHTML.trim());
+  document.body.classList.toggle('in-session', on);
+}
 
 /* ============ BACKUP BANNER ============ */
 function renderBackupBanner(){
@@ -208,8 +246,7 @@ function renderBackupBanner(){
   const days = last ? Math.floor((now - new Date(last).getTime())/86400000) : null;
   const isDanger = days!==null && days>30;
   el.className = 'backup-banner' + (isDanger?' danger':'');
-  el.innerHTML = `
-    <span>⚠ ${last ? `Dernière sauvegarde il y a ${days} jour${days>1?'s':''}` : 'Aucune sauvegarde enregistrée'}</span>
+  el.innerHTML = `<span>⚠ ${last ? `Dernière sauvegarde il y a ${days} jour${days>1?'s':''}` : 'Aucune sauvegarde enregistrée'}</span>
     <div style="display:flex;gap:6px">
       <button onclick="exportBackup()">Exporter maintenant</button>
       <button class="dismiss" onclick="dismissBanner()" title="Masquer">×</button>
@@ -228,6 +265,10 @@ function renderHome(){
   const total = State.questions.length;
   const due = dueCount();
   const mistakes = State.questions.filter(q=>q.lastResult===false).length;
+  const streak = computeStreak();
+  const goal = State.config.dailyGoal || DAILY_GOAL_DEFAULT;
+  const done = todayAttempts();
+  const goalPct = Math.min(100, Math.round(100*done/goal));
 
   if(total===0 && State.cours.length===0){
     root.innerHTML = renderOnboarding();
@@ -258,9 +299,19 @@ function renderHome(){
   const statsHTML = `<div class="stats">
     <div class="stat blue"><div class="num">${total}</div><div class="lbl">Questions</div></div>
     <div class="stat gold"><div class="num">${due}</div><div class="lbl">À réviser</div></div>
-    <div class="stat"><div class="num">${State.history.length}</div><div class="lbl">Séances</div></div>
+    <div class="stat"><div class="num">${streak} 🔥</div><div class="lbl">Jours d'affilée</div></div>
     <div class="stat danger"><div class="num">${mistakes}</div><div class="lbl">Erreurs</div></div>
   </div>`;
+
+  const goalHTML = `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <h3 style="font-size:15px">Objectif du jour</h3>
+        <span class="small">${done}/${goal}</span>
+      </div>
+      <div class="bar ${goalPct>=100?'green':'gold'}"><span style="width:${goalPct}%"></span></div>
+      <p class="small" style="margin-top:6px">${goalPct>=100 ? '✓ Objectif atteint' : `${goal-done} question${goal-done>1?'s':''} restante${goal-done>1?'s':''}`}</p>
+    </div>`;
 
   const coursList = State.cours.map(c=>{
     const qs = questionsOfCours(c.id);
@@ -282,7 +333,7 @@ function renderHome(){
     </div>`;
   }).join('') : '<div class="empty" style="padding:20px"><p>Crée un cours et ajoute des questions.</p></div>';
 
-  root.innerHTML = `${heroHTML}${statsHTML}
+  root.innerHTML = `${heroHTML}${statsHTML}${goalHTML}
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
         <h3 style="font-size:15px">Mes cours</h3>
@@ -332,7 +383,6 @@ function openNewMatiere(){
   $('#btnCreateMat').onclick = async ()=>{
     const nom = $('#newMatNom').value.trim();
     if(!nom){ toast('Nom requis','error'); return; }
-    const selected = document.querySelector('[data-c]');
     const btn = [...document.querySelectorAll('[data-c]')].find(b=>b.style.borderColor.includes('13, 47, 85')||b.style.borderColor.includes('rgb(13, 47, 85)'));
     const couleur = btn ? btn.dataset.c : MATIERE_COLORS[0];
     const m = { id: uid(), nom, couleur, createdAt: Date.now() };
@@ -446,14 +496,8 @@ function renderCourses(){
       const correct = qs.reduce((n,q)=>n+(q.correctAttempts||0),0);
       const p = pct(correct, attempts);
       return `<div class="cours-row">
-        <div class="cours-info">
-          <b>${esc(c.nom)}</b>
-          <div class="mini-stats">${qs.length} question${qs.length!==1?'s':''}${due?' · '+due+' à revoir':''}${attempts?' · '+p+'% réussite':''}</div>
-        </div>
-        <div class="cours-progress">
-          <div class="pct">${qs.length?p+'%':'—'}</div>
-          <div class="bar ${p>=70?'green':p>=40?'gold':''}"><span style="width:${p}%"></span></div>
-        </div>
+        <div class="cours-info"><b>${esc(c.nom)}</b><div class="mini-stats">${qs.length} question${qs.length!==1?'s':''}${due?' · '+due+' à revoir':''}${attempts?' · '+p+'% réussite':''}</div></div>
+        <div class="cours-progress"><div class="pct">${qs.length?p+'%':'—'}</div><div class="bar ${p>=70?'green':p>=40?'gold':''}"><span style="width:${p}%"></span></div></div>
         <div class="cours-actions">
           <button class="btn btn-primary btn-sm" onclick="quickTrain('${c.id}')" ${qs.length?'':'disabled'}>Réviser</button>
           <button class="btn btn-outline btn-sm" onclick="openEditCours('${c.id}')" title="Renommer">✎</button>
@@ -466,10 +510,7 @@ function renderCourses(){
       <div class="matiere-header">
         <div style="display:flex;align-items:center;gap:12px">
           <div style="width:6px;height:38px;border-radius:3px;background:${esc(m.couleur||'#0066cc')}"></div>
-          <div>
-            <h3>${esc(m.nom)}</h3>
-            <div class="meta">${cs.length} cours · ${totalQ} question${totalQ!==1?'s':''}</div>
-          </div>
+          <div><h3>${esc(m.nom)}</h3><div class="meta">${cs.length} cours · ${totalQ} question${totalQ!==1?'s':''}</div></div>
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap">
           <button class="btn btn-light btn-sm" onclick="openNewCours('${m.id}')">+ Cours</button>
@@ -481,12 +522,8 @@ function renderCourses(){
     </div>`;
   }).join('') : `<div class="empty"><div class="empty-icon">📚</div><h3>Aucune matière</h3><p>Commence par créer une matière (ex : Neurologie)</p><button class="btn btn-primary" onclick="openNewMatiere()">Créer une matière</button></div>`;
 
-  root.innerHTML = `
-    <div class="page-title">Mes cours</div>
-    <div class="page-sub">Organise ton programme par matière et cours</div>
-    <div class="actions" style="margin-bottom:16px">
-      <button class="btn btn-primary" onclick="openNewMatiere()">+ Nouvelle matière</button>
-    </div>
+  root.innerHTML = `<div class="page-title">Mes cours</div><div class="page-sub">Organise ton programme par matière et cours</div>
+    <div class="actions" style="margin-bottom:16px"><button class="btn btn-primary" onclick="openNewMatiere()">+ Nouvelle matière</button></div>
     ${matieresHTML}`;
 }
 
@@ -497,34 +534,25 @@ function renderTrain(){
   root.innerHTML = `
     <div class="page-title">Entraînement</div>
     <div class="page-sub">Configure une séance</div>
+    <div class="card edn-quick">
+      <b>Lancement rapide</b>
+      <div class="actions" style="margin-top:0">
+        <button class="btn btn-primary" onclick="miniEDN()">Mini-EDN · 30 Q · 45 min</button>
+        <button class="btn btn-light" onclick="launchSession({mode:'training',countVal:'all',minutes:0,scoreRule:'edn',onlyMistakes:true,doShuffle:true})">Revoir mes erreurs</button>
+      </div>
+    </div>
     <div class="card">
       <div class="form-grid">
         <div><label class="field">Mode</label><select id="cfgMode">
-          <option value="training">Apprentissage</option>
-          <option value="exam">Examen blanc</option>
-          <option value="review">Révision espacée</option>
+          <option value="training">Apprentissage</option><option value="exam">Examen blanc</option><option value="review">Révision espacée</option>
         </select></div>
         <div><label class="field">Matière</label><select id="cfgMatiere"><option value="">Toutes</option>${matieresOpts}</select></div>
         <div><label class="field">Cours</label><select id="cfgCours"><option value="">Tous</option></select></div>
-        <div><label class="field">Type</label><select id="cfgType">
-          <option value="">Tous</option>
-          <option value="qcm">QCM / QRM / QRU</option>
-          <option value="qroc">QROC / KFP</option>
-        </select></div>
-        <div><label class="field">Nombre</label><select id="cfgCount">
-          <option>10</option><option selected>20</option><option>30</option><option>40</option><option>60</option><option value="all">Toutes</option>
-        </select></div>
+        <div><label class="field">Type</label><select id="cfgType"><option value="">Tous</option><option value="qcm">QCM / QRM / QRU</option><option value="qroc">QROC / KFP</option></select></div>
+        <div><label class="field">Nombre</label><select id="cfgCount"><option>10</option><option selected>20</option><option>30</option><option>40</option><option>60</option><option value="all">Toutes</option></select></div>
         <div><label class="field">Durée (min, 0 = libre)</label><input type="number" id="cfgMinutes" min="0" max="240" value="30"></div>
-        <div><label class="field">Barème QCM</label><select id="cfgScore">
-          <option value="edn" selected>Barème EDN (discordances)</option>
-          <option value="exact">Tout ou rien</option>
-          <option value="partial">Partiel simple</option>
-        </select></div>
-        <div><label class="field">Statut</label><select id="cfgStatut">
-          <option value="">Tous</option>
-          <option value="validée">Validées uniquement</option>
-          <option value="non_validée">Non validées</option>
-        </select></div>
+        <div><label class="field">Barème QCM</label><select id="cfgScore"><option value="edn" selected>Barème EDN (discordances)</option><option value="exact">Tout ou rien</option><option value="partial">Partiel simple</option></select></div>
+        <div><label class="field">Statut</label><select id="cfgStatut"><option value="">Tous</option><option value="validée">Validées uniquement</option><option value="non_validée">Non validées</option></select></div>
       </div>
       <div style="margin-top:14px">
         <label class="checkboxline"><input type="checkbox" id="cfgOnlyMistakes"> Uniquement mes erreurs</label>
@@ -563,6 +591,9 @@ function startReview(){
   if(!due.length){ toast('Rien à réviser','info'); return; }
   launchSession({ mode:'training', countVal: due.length, minutes:0, scoreRule:'edn', onlyMistakes:false, doShuffle:false, onlyDue:true, questionsOverride:due });
 }
+function miniEDN(){
+  launchSession({ mode:'exam', countVal:30, minutes:45, scoreRule:'edn', doShuffle:true });
+}
 
 function launchSession(cfg){
   if(State.timer){ clearInterval(State.timer); State.timer=null; }
@@ -588,9 +619,8 @@ function launchSession(cfg){
   if(!qs.length){ toast('Aucune question ne correspond','error'); return; }
   State.session = {
     mode: cfg.mode, questions: qs, answers: {}, revealed: {}, submitted: {},
-    index: 0, started: Date.now(),
-    remaining: (cfg.minutes||0)*60,
-    scoreRule: cfg.scoreRule, finished: false, config: cfg
+    index: 0, started: Date.now(), remaining: (cfg.minutes||0)*60,
+    scoreRule: cfg.scoreRule, finished: false, config: cfg, flags: {}
   };
   showView('train');
   renderSession();
@@ -607,6 +637,7 @@ function launchSession(cfg){
 }
 
 /* ============ SESSION RENDERING ============ */
+let lastIdx = -1, lastSess = null;
 function renderSession(){
   const root = $('#sessionArea');
   if(!State.session){ root.innerHTML=''; return; }
@@ -614,27 +645,31 @@ function renderSession(){
   const s = State.session;
   const q = s.questions[s.index];
   const idx = s.index;
-  const answered = Object.keys(s.answers).length;
+  const changed = (s !== lastSess || idx !== lastIdx);
   const modeLabel = { training:'Apprentissage', exam:'Examen blanc', review:'Révision espacée' }[s.mode];
   const cours = getCours(q.coursId);
   const matiere = cours ? getMatiere(cours.matiereId) : null;
+  const f = s.flags || (s.flags = {});
+  const navBtns = s.questions.map((x,i)=>{
+    const cls = `${i===s.index?'cur ':''}${hasAns(s,x)?'ans ':''}${f[x.id]?'flag':''}`;
+    return `<button class="${cls}" onclick="goQ(${i})">${i+1}</button>`;
+  }).join('');
 
   let html = `<div class="session-bar">
-    <div>
-      <b style="font-size:13px">${modeLabel}</b>
-      <div class="small">Question ${idx+1}/${s.questions.length} · ${answered} réponse${answered>1?'s':''}</div>
-    </div>
+    <div><b style="font-size:13px">${modeLabel}</b><div class="small">Question ${idx+1}/${s.questions.length} · ${Object.keys(s.answers).length} réponse${Object.keys(s.answers).length>1?'s':''}</div></div>
     <div class="timer" id="timer">${s.mode==='exam'&&s.remaining>0 ? fmtTime(s.remaining) : '∞'}</div>
     <button class="btn btn-outline btn-sm" onclick="quitSession()">Quitter</button>
     <div class="session-hint">A-E : cocher · ⏎ : valider/suivant · ←→ : naviguer</div>
   </div>
   <div class="progress"><span style="width:${100*idx/s.questions.length}%"></span></div>
+  <div class="qnav">${navBtns}</div>
   <div class="q-card">
     <div class="q-meta">
       <span class="pill blue">${esc(q.type)}</span>
       ${matiere?`<span class="pill">${esc(matiere.nom)}</span>`:''}
       ${cours?`<span class="pill">${esc(cours.nom)}</span>`:''}
       ${q.section?`<span class="pill">${esc(q.section)}</span>`:''}
+      ${q.rang?`<span class="pill gold">Rang ${esc(q.rang)}</span>`:''}
       <span class="pill gold">Box ${(q.box||0)+1}</span>
       <span class="pill">${esc(q.difficulty||'Standard')}</span>
     </div>
@@ -644,16 +679,47 @@ function renderSession(){
     ${s.revealed[q.id] && s.mode!=='exam' ? renderFeedback(q, s) : ''}
   </div>
   <div class="actions">
-    ${idx>0?`<button class="btn btn-light" onclick="prevQ()">← Précédente</button>`:''}
+    <button class="btn btn-outline ico${f[q.id]?' on':''}" onclick="toggleFlag()" title="Marquer (F)">${f[q.id]?'⚑':'⚐'}</button>
+    <button class="btn btn-outline ico" onclick="openGrid()" title="Grille">☰</button>
+    ${idx>0?`<button class="btn btn-light" onclick="prevQ()">←</button>`:''}
     ${s.mode!=='exam' && !s.revealed[q.id] ? `<button class="btn btn-primary" onclick="revealAnswer()">Vérifier</button>` : ''}
     ${idx<s.questions.length-1
       ? `<button class="btn btn-primary" onclick="nextQ()">Suivante →</button>`
-      : `<button class="btn btn-primary" onclick="finishSession(false)">Terminer la séance</button>`}
+      : `<button class="btn btn-primary" onclick="finishSession(false)">Terminer</button>`}
   </div>
   ${s.mode==='exam' ? '<p class="small" style="margin-top:10px">Corrections masquées jusqu\'à la fin.</p>' : ''}`;
 
   root.innerHTML = html;
   bindAnswerInputs(q);
+  lastSess = s; lastIdx = idx;
+  const cur = document.querySelector('.qnav .cur');
+  if(cur) cur.scrollIntoView({behavior:'smooth',block:'nearest',inline:'center'});
+  if(changed) root.scrollTop = 0;
+  syncFull();
+}
+
+function hasAns(s,q){
+  const a = s.answers[q.id];
+  return Array.isArray(a) ? a.length>0 : !!(a && String(a).trim());
+}
+function goQ(i){ saveAnswer(); State.session.index=i; renderSession(); }
+function toggleFlag(){
+  const s = State.session; if(!s) return;
+  saveAnswer();
+  const id = s.questions[s.index].id;
+  s.flags = s.flags || {};
+  s.flags[id] = !s.flags[id];
+  renderSession();
+}
+function openGrid(){
+  const s = State.session; if(!s) return;
+  saveAnswer();
+  const n = s.questions.filter(q=>!hasAns(s,q)).length;
+  const btns = s.questions.map((x,i)=>{
+    const cls = `${i===s.index?'cur ':''}${hasAns(s,x)?'ans ':''}${(s.flags||{})[x.id]?'flag':''}`;
+    return `<button class="${cls}" onclick="closeModal();goQ(${i})">${i+1}</button>`;
+  }).join('');
+  openModal(`<h3>Navigation</h3><p class="modal-sub">${s.questions.length-n}/${s.questions.length} répondues · ${n} sans réponse</p><div class="qnav">${btns}</div><p class="small" style="margin-top:10px">Bleu : répondue · Doré : marquée · Marine : en cours</p><div class="actions"><button class="btn btn-primary" onclick="closeModal();finishSession(false)">Terminer l'épreuve</button></div>`);
 }
 
 function renderAnswerInputs(q, s){
@@ -663,10 +729,9 @@ function renderAnswerInputs(q, s){
   const single = q.type==='QRU';
   return q.opts.map((opt,i)=>{
     const letter = String.fromCharCode(65+i);
-    return `<label class="q-opt"><input type="${single?'radio':'checkbox'}" name="ans_${q.id}" value="${i}" ${picked.includes(i)?'checked':''}><span class="letter">${letter}.</span><span>${esc(opt)}</span></label>`;
+    return `<label class="q-opt"><input type="${single?'radio':'checkbox'}" name="ans_${q.id}" value="${i}" ${picked.includes(i)?'checked':''}><span class="letter">${letter}</span><span>${esc(opt)}</span></label>`;
   }).join('');
 }
-
 function bindAnswerInputs(q){
   const s = State.session;
   const sel = `[name="ans_${CSS.escape(q.id)}"]`;
@@ -683,7 +748,6 @@ function bindAnswerInputs(q){
   const ta = document.getElementById('answer_'+q.id);
   if(ta) ta.addEventListener('input', ()=> s.answers[q.id] = ta.value);
 }
-
 function saveAnswer(){
   if(!State.session) return;
   const s = State.session;
@@ -693,7 +757,6 @@ function saveAnswer(){
   const sel = `[name="ans_${CSS.escape(q.id)}"]`;
   s.answers[q.id] = [...document.querySelectorAll(`${sel}:checked`)].map(x=>Number(x.value));
 }
-
 function renderFeedback(q, s){
   if(['QROC','KFP'].includes(q.type)){
     return `<div class="feedback"><h4>Éléments attendus</h4><p>${esc(q.expected||q.exp||'Non renseigné')}</p><p class="small">Auto-évaluation.</p></div>`;
@@ -701,26 +764,15 @@ function renderFeedback(q, s){
   if(q.type==='QRU'){
     const sc = scoreQuestion(q, s.answers[q.id], s.scoreRule);
     const ok = sc>=1;
-    return `<div class="feedback ${ok?'good':'bad'}">
-      <h4>${ok?'✓ Correct':'✕ À revoir'}</h4>
-      <p><b>Réponse attendue :</b> ${esc((q.ans||[]).map(i=>String.fromCharCode(65+i)).join(', ')||'—')}</p>
-      <p>${esc(q.exp||'')}</p>
-      ${q.source?`<p class="source">Source : ${esc(q.source)}</p>`:''}
-    </div>`;
+    return `<div class="feedback ${ok?'good':'bad'}"><h4>${ok?'✓ Correct':'✕ À revoir'}</h4><p><b>Réponse attendue :</b> ${esc((q.ans||[]).map(i=>String.fromCharCode(65+i)).join(', ')||'—')}</p><p>${esc(q.exp||'')}</p>${q.source?`<p class="source">Source : ${esc(q.source)}</p>`:''}</div>`;
   }
   const d = getDiscordances(q, s.answers[q.id]);
   const sc = scoreQuestion(q, s.answers[q.id], s.scoreRule);
   const cls = d.discordances===0 ? 'good' : (sc>0 ? 'partial' : 'bad');
   const label = d.discordances===0 ? '✓ Correct' : `${d.discordances} discordance${d.discordances>1?'s':''} — ${Math.round(sc*100)}%`;
   const ans = (q.ans||[]).map(i=>String.fromCharCode(65+i)).join(', ');
-  return `<div class="feedback ${cls}">
-    <h4>${label}</h4>
-    <p><b>Réponse attendue :</b> ${esc(ans||'—')}</p>
-    <p>${esc(q.exp||'')}</p>
-    ${q.source?`<p class="source">Source : ${esc(q.source)}</p>`:''}
-  </div>`;
+  return `<div class="feedback ${cls}"><h4>${label}</h4><p><b>Réponse attendue :</b> ${esc(ans||'—')}</p><p>${esc(q.exp||'')}</p>${q.source?`<p class="source">Source : ${esc(q.source)}</p>`:''}</div>`;
 }
-
 function revealAnswer(){
   saveAnswer();
   const s = State.session;
@@ -738,19 +790,37 @@ function revealAnswer(){
   s.submitted[q.id] = true;
   s.revealed[q.id] = true;
   renderSession();
+  setTimeout(()=>{
+    const fb = document.querySelector('#sessionArea .feedback');
+    if(fb) fb.scrollIntoView({behavior:'smooth',block:'center'});
+  }, 60);
 }
-function nextQ(){ if(!State.session) return; saveAnswer(); State.session.index++; renderSession(); window.scrollTo({top:0,behavior:'smooth'}); }
-function prevQ(){ if(!State.session) return; saveAnswer(); State.session.index--; renderSession(); window.scrollTo({top:0,behavior:'smooth'}); }
-
+function nextQ(){
+  const s = State.session;
+  if(!s || s.index >= s.questions.length-1) return;
+  saveAnswer(); s.index++; renderSession(); window.scrollTo({top:0,behavior:'smooth'});
+}
+function prevQ(){
+  const s = State.session;
+  if(!s || s.index <= 0) return;
+  saveAnswer(); s.index--; renderSession(); window.scrollTo({top:0,behavior:'smooth'});
+}
 function quitSession(){
   confirmModal('Quitter la séance ?', 'La progression non terminée ne sera pas enregistrée.',
-    ()=>{ if(State.timer) clearInterval(State.timer); State.timer=null; State.session=null; $('#sessionArea').innerHTML=''; },
+    ()=>{ if(State.timer) clearInterval(State.timer); State.timer=null; State.session=null; $('#sessionArea').innerHTML=''; syncFull(); },
     {danger:true, confirmLabel:'Quitter'});
 }
-
 function finishSession(timeUp=false){
   const s = State.session;
   if(!s || s.finished) return;
+  if(!timeUp && !s._ok){
+    saveAnswer();
+    const un = s.questions.filter(q=>!hasAns(s,q)).length;
+    const fl = Object.values(s.flags||{}).filter(Boolean).length;
+    confirmModal("Terminer l'épreuve ?", `${un} sans réponse · ${fl} marquée(s). Après validation, plus aucune modification.`,
+      ()=>{ s._ok=true; finishSession(false); }, {confirmLabel:'Terminer'});
+    return;
+  }
   saveAnswer();
   s.finished = true;
   if(State.timer){ clearInterval(State.timer); State.timer=null; }
@@ -769,18 +839,13 @@ function finishSession(timeUp=false){
     qcmScoreSum += sc;
   });
   const record = {
-    id: uid(),
-    date: new Date().toISOString(),
-    mode: s.mode,
-    coursId: s.config.coursId || null,
-    matiereId: s.config.matiereId || null,
-    total: s.questions.length,
-    qcmTotal, qcmCorrect,
+    id: uid(), date: new Date().toISOString(), mode: s.mode,
+    coursId: s.config.coursId || null, matiereId: s.config.matiereId || null,
+    total: s.questions.length, qcmTotal, qcmCorrect,
     score: qcmTotal ? Math.round(100*qcmScoreSum/qcmTotal) : null,
     scoreExact: qcmTotal ? Math.round(100*qcmCorrect/qcmTotal) : null,
     scoreRule: s.scoreRule,
-    timeSeconds: Math.round((Date.now()-s.started)/1000),
-    timeUp
+    timeSeconds: Math.round((Date.now()-s.started)/1000), timeUp
   };
   State.history.unshift(record);
   dbPut('history', record);
@@ -798,12 +863,15 @@ function renderResults(){
   const weighted = qcm.reduce((n,q)=>n+(scoreQuestion(q, s.answers[q.id], s.scoreRule)||0), 0);
   const pExact = qcm.length ? Math.round(100*exactCorrect/qcm.length) : null;
   const pWeighted = qcm.length ? Math.round(100*weighted/qcm.length) : null;
+  const note20 = s.scoreRule==='edn' && qcm.length ? (weighted/qcm.length*20).toFixed(1) : null;
 
   let html = `<div class="card" style="text-align:center;padding:32px 20px">
     <div class="eyebrow" style="color:var(--gold)">Séance terminée</div>
     <div style="font-size:56px;font-weight:900;letter-spacing:-.04em;color:${pWeighted>=70?'var(--success)':pWeighted>=40?'var(--gold)':'var(--danger)'};line-height:1;margin:10px 0">${pWeighted!==null?pWeighted+'%':'—'}</div>
-    <p class="muted" style="font-size:13px">Score pondéré — barème ${s.scoreRule==='edn'?'EDN':s.scoreRule==='partial'?'partiel':'tout ou rien'}</p>
-    ${pExact!==null?`<p class="small" style="margin-top:6px">Sans faute : ${exactCorrect}/${qcm.length} · ${pExact}% · ${s.questions.length-qcm.length} question(s) rédigée(s)</p>`:''}
+    ${note20?`<div class="note20">Note estimée : ${note20}/20</div>`:''}
+    <p class="muted" style="font-size:13px">Score pondéré — barème ${s.scoreRule==='edn'?'SIDES/EDN':s.scoreRule==='partial'?'partiel':'tout ou rien'}</p>
+    ${pExact!==null?`<p class="small" style="margin-top:6px">Sans faute : ${exactCorrect}/${qcm.length} · ${pExact}% · ${s.questions.length-qcm.length} rédigée(s)</p>`:''}
+    <div class="seg"><button class="on" onclick="filterRes(0,this)">Toutes</button><button onclick="filterRes(1,this)">Erreurs</button></div>
     <div class="actions" style="justify-content:center">
       <button class="btn btn-primary" onclick="showView('home')">Accueil</button>
       <button class="btn btn-light" onclick="showView('train');State.session=null;$('#sessionArea').innerHTML=''">Nouvelle séance</button>
@@ -817,9 +885,8 @@ function renderResults(){
     const ok = sc===null ? null : sc>=0.99;
     const partial = sc!==null && sc>0 && sc<0.99;
     const cours = getCours(q.coursId);
-    const discLabel = d && !isShort ? (d.discordances===0?'0 discordance':`${d.discordances} discordance${d.discordances>1?'s':''}`) : '';
+    const discLabel = d && !isShort ? (d.discordances===0?'0 disc.':`${d.discordances} disc.`) : '';
     const scoreLabel = sc!==null ? ` · ${Math.round(sc*100)}%` : '';
-
     html += `<div class="q-card">
       <div class="q-meta">
         <span class="pill blue">${esc(q.type)}</span>
@@ -837,14 +904,21 @@ function renderResults(){
       <div class="actions" style="margin-top:10px">
         ${q.statut!=='validée'?`<button class="btn btn-success btn-sm" onclick="validateQuestionInline('${q.id}')">✓ Valider</button>`:'<span class="pill green">Validée</span>'}
         <button class="btn btn-outline btn-sm" onclick="openEditQuestion('${q.id}')">✎ Modifier</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteQuestionInline('${q.id}')">🗑 Supprimer</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteQuestionInline('${q.id}')">🗑 Suppr.</button>
       </div>
     </div>`;
   });
   root.innerHTML = html;
-  window.scrollTo({top:0,behavior:'smooth'});
+  root.scrollTop = 0;
+  syncFull();
 }
-
+function filterRes(err,btn){
+  btn.parentNode.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b===btn));
+  document.querySelectorAll('#sessionArea > .q-card').forEach(x=>{
+    const bad = [...x.querySelectorAll('.q-meta .pill')].some(p=>/[✕◐]/.test(p.textContent));
+    x.style.display = (err && !bad) ? 'none' : '';
+  });
+}
 async function validateQuestionInline(id){
   const q = State.questions.find(x=>x.id===id);
   if(!q) return;
@@ -878,8 +952,9 @@ function renderBank(){
         <div><label class="field">Cours</label><select id="bankCours"><option value="">Tous</option></select></div>
         <div><label class="field">Type</label><select id="bankType"><option value="">Tous</option>${Q_TYPES.map(t=>`<option value="${t}">${t}</option>`).join('')}</select></div>
         <div><label class="field">Statut</label><select id="bankStatut"><option value="">Tous</option>${STATUTS.map(s=>`<option value="${s}">${statutLabel(s)}</option>`).join('')}</select></div>
-        <div style="display:flex;align-items:flex-end"><button class="btn btn-primary btn-block" onclick="openNewQuestion()">+ Nouvelle question</button></div>
+        <div><label class="field">Tri</label><select id="bankSort"><option value="default">Par défaut</option><option value="weak">Plus faibles d'abord</option><option value="hard">Difficulté</option><option value="new">Plus récentes</option></select></div>
       </div>
+      <div class="actions" style="margin-top:10px"><button class="btn btn-primary btn-block" onclick="openNewQuestion()">+ Nouvelle question</button></div>
     </div>
     <div id="bankList"></div>`;
   $('#bankMat').addEventListener('change', ()=>{
@@ -888,19 +963,19 @@ function renderBank(){
     $('#bankCours').innerHTML = '<option value="">Tous</option>' + cs.map(c=>`<option value="${c.id}">${esc(c.nom)}</option>`).join('');
     renderBankList();
   });
-  $('#bankSearch').addEventListener('input', renderBankList);
-  $('#bankCours').addEventListener('change', renderBankList);
-  $('#bankType').addEventListener('change', renderBankList);
-  $('#bankStatut').addEventListener('change', renderBankList);
+  ['bankSearch','bankCours','bankType','bankStatut','bankSort'].forEach(id=>{
+    document.getElementById(id).addEventListener('input', renderBankList);
+    document.getElementById(id).addEventListener('change', renderBankList);
+  });
   renderBankList();
 }
-
 function renderBankList(){
   const search = ($('#bankSearch')?.value||'').toLowerCase();
   const mid = $('#bankMat')?.value||'';
   const cid = $('#bankCours')?.value||'';
   const type = $('#bankType')?.value||'';
   const statut = $('#bankStatut')?.value||'';
+  const sort = $('#bankSort')?.value||'default';
   let qs = State.questions.filter(q=>{
     if(cid && q.coursId!==cid) return false;
     if(mid){
@@ -915,6 +990,10 @@ function renderBankList(){
     }
     return true;
   });
+  if(sort==='weak') qs = qs.slice().sort((a,b)=>pct(a.correctAttempts,a.attempts)-pct(b.correctAttempts,b.attempts));
+  if(sort==='hard') qs = qs.slice().sort((a,b)=>['Difficile','Standard','Facile'].indexOf(a.difficulty)-['Difficile','Standard','Facile'].indexOf(b.difficulty));
+  if(sort==='new') qs = qs.slice().sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+
   const root = $('#bankList');
   if(!qs.length){
     root.innerHTML = `<div class="empty"><div class="empty-icon">🔍</div><h3>Aucune question trouvée</h3><p>Modifie les filtres ou ajoute des questions.</p></div>`;
@@ -930,6 +1009,7 @@ function renderBankList(){
         ${matiere?`<span class="pill">${esc(matiere.nom)}</span>`:''}
         ${cours?`<span class="pill">${esc(cours.nom)}</span>`:''}
         ${q.section?`<span class="pill">${esc(q.section)}</span>`:''}
+        ${q.rang?`<span class="pill gold">Rang ${esc(q.rang)}</span>`:''}
         <span class="pill ${statutColor(q.statut)}">${esc(statutLabel(q.statut))}</span>
         <span class="pill">Box ${(q.box||0)+1}</span>
         ${q.lastResult===false?'<span class="pill red">À revoir</span>':''}
@@ -968,7 +1048,7 @@ function singleTrain(id){
   showView('train');
   State.session = {
     mode:'training', questions:[q], answers:{}, revealed:{}, submitted:{},
-    index:0, started:Date.now(), remaining:0, scoreRule:'edn', finished:false, config:{}
+    index:0, started:Date.now(), remaining:0, scoreRule:'edn', finished:false, config:{}, flags:{}
   };
   renderSession();
   setTimeout(()=>$('#sessionArea')?.scrollIntoView({behavior:'smooth'}), 100);
@@ -1003,11 +1083,8 @@ function questionFormHTML(q){
       <div><label class="field">Cours</label><select id="qCours">${coursOpts}</select></div>
       <div><label class="field">Section</label><input type="text" id="qSection" value="${esc(q?.section||'')}" placeholder="Ex : Voies sensitives"></div>
       <div><label class="field">Type</label><select id="qType">${Q_TYPES.map(t=>`<option ${q?.type===t?'selected':''}>${t}</option>`).join('')}</select></div>
-      <div><label class="field">Difficulté</label><select id="qDiff">
-        <option ${q?.difficulty==='Facile'?'selected':''}>Facile</option>
-        <option ${(!q||q?.difficulty==='Standard')?'selected':''}>Standard</option>
-        <option ${q?.difficulty==='Difficile'?'selected':''}>Difficile</option>
-      </select></div>
+      <div><label class="field">Rang EDN</label><select id="qRang"><option value="">—</option>${RANGS.map(r=>`<option ${q?.rang===r?'selected':''}>${r}</option>`).join('')}</select></div>
+      <div><label class="field">Difficulté</label><select id="qDiff"><option ${q?.difficulty==='Facile'?'selected':''}>Facile</option><option ${(!q||q?.difficulty==='Standard')?'selected':''}>Standard</option><option ${q?.difficulty==='Difficile'?'selected':''}>Difficile</option></select></div>
       <div><label class="field">Statut</label><select id="qStatut">${STATUTS.map(s=>`<option value="${s}" ${q?.statut===s?'selected':''}>${statutLabel(s)}</option>`).join('')}</select></div>
     </div>
     <label class="field">Énoncé</label>
@@ -1040,14 +1117,12 @@ function mountQuestionForm(q){
     const type = $('#qType').value;
     const opts = $('#qOpts').value.split('\n').map(s=>s.trim()).filter(Boolean);
     const ans = $('#qAns').value.split(',').map(s=>Number(s.trim())).filter(n=>!isNaN(n) && n>=0 && n<opts.length);
-    if(['QCM','QRM','QRU'].includes(type) && opts.length && !ans.length){
-      toast('Indique au moins une réponse correcte','error'); return;
-    }
+    if(['QCM','QRM','QRU'].includes(type) && opts.length && !ans.length){ toast('Indique au moins une réponse correcte','error'); return; }
     const data = {
-      id: q?.id || uid(),
-      coursId,
+      id: q?.id || uid(), coursId,
       section: $('#qSection').value.trim(),
-      type, difficulty: $('#qDiff').value, statut: $('#qStatut').value,
+      type, rang: $('#qRang').value || null,
+      difficulty: $('#qDiff').value, statut: $('#qStatut').value,
       stem, opts, ans,
       expected: $('#qExpected').value.trim(),
       exp: $('#qExp').value.trim(),
@@ -1079,6 +1154,7 @@ function renderStats(){
   const totalAttempts = State.questions.reduce((n,q)=>n+(q.attempts||0),0);
   const totalCorrect = State.questions.reduce((n,q)=>n+(q.correctAttempts||0),0);
   const accGlobal = pct(totalCorrect, totalAttempts);
+  const streak = computeStreak();
   const byMat = State.matieres.map(m=>{
     const qs = questionsOfMatiere(m.id);
     const att = qs.reduce((n,q)=>n+(q.attempts||0),0);
@@ -1092,48 +1168,58 @@ function renderStats(){
     return { c, n:qs.length, att, pct:pct(cor,att) };
   }).filter(x=>x.n>0).sort((a,b)=>a.pct-b.pct);
   const recent = State.history.slice(0,5);
-  root.innerHTML = `
-    <div class="page-title">Statistiques</div>
-    <div class="page-sub">Progression par matière et cours</div>
+  const fc = forecast(7);
+  const maxFc = Math.max(1, ...fc.map(x=>x.count));
+
+  root.innerHTML = `<div class="page-title">Statistiques</div><div class="page-sub">Progression par matière et cours</div>
     <div class="stats">
       <div class="stat blue"><div class="num">${State.questions.length}</div><div class="lbl">Questions</div></div>
       <div class="stat"><div class="num">${State.history.length}</div><div class="lbl">Séances</div></div>
       <div class="stat ${accGlobal>=70?'blue':'gold'}"><div class="num">${totalAttempts?accGlobal+'%':'—'}</div><div class="lbl">Réussite</div></div>
-      <div class="stat gold"><div class="num">${dueCount()}</div><div class="lbl">À réviser</div></div>
+      <div class="stat gold"><div class="num">${streak} 🔥</div><div class="lbl">Jours d'affilée</div></div>
     </div>
+
+    <div class="card">
+      <h3 style="font-size:15px;margin-bottom:14px">Prévision 7 jours</h3>
+      <div style="display:flex;gap:6px;align-items:flex-end;height:90px">
+        ${fc.map((x,i)=>{
+          const h = Math.round(70*x.count/maxFc);
+          const isToday = i===0;
+          return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
+            <div style="width:100%;height:${h}px;min-height:4px;background:${isToday?'var(--blue)':'var(--blue-soft)'};border-radius:4px 4px 0 0"></div>
+            <div class="small" style="font-size:10px">${x.count}</div>
+            <div class="small" style="font-size:10px">${new Date(x.date).toLocaleDateString('fr-FR',{weekday:'short'})}</div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+
     <div class="card">
       <h3 style="font-size:15px;margin-bottom:14px">Par matière</h3>
       ${byMat.length ? byMat.map(x=>`
         <div style="margin-bottom:16px">
-          <div style="display:flex;justify-content:space-between;margin-bottom:5px">
-            <b style="font-size:13px">${esc(x.m.nom)}</b>
-            <span class="small">${x.pct}% · ${x.att} tentatives${x.due?' · '+x.due+' à revoir':''}</span>
-          </div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:5px"><b style="font-size:13px">${esc(x.m.nom)}</b><span class="small">${x.pct}% · ${x.att} tentatives${x.due?' · '+x.due+' à revoir':''}</span></div>
           <div class="bar bar-thick ${x.pct>=70?'green':x.pct>=40?'gold':''}"><span style="width:${x.pct}%"></span></div>
         </div>
       `).join('') : '<p class="muted">Aucune donnée.</p>'}
     </div>
+
     <div class="card">
       <h3 style="font-size:15px;margin-bottom:14px">Par cours</h3>
       ${byCours.length ? byCours.map(x=>{
         const mat = getMatiere(x.c.matiereId);
         return `<div style="margin-bottom:16px">
-          <div style="display:flex;justify-content:space-between;margin-bottom:5px">
-            <b style="font-size:13px">${esc(x.c.nom)}</b>
-            <span class="small">${esc(mat?.nom||'')} · ${x.pct}% · ${x.n} Q</span>
-          </div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:5px"><b style="font-size:13px">${esc(x.c.nom)}</b><span class="small">${esc(mat?.nom||'')} · ${x.pct}% · ${x.n} Q</span></div>
           <div class="bar ${x.pct>=70?'green':x.pct>=40?'gold':''}"><span style="width:${x.pct}%"></span></div>
         </div>`;
       }).join('') : '<p class="muted">Aucune donnée.</p>'}
     </div>
+
     <div class="card">
       <h3 style="font-size:15px;margin-bottom:14px">Séances récentes</h3>
       ${recent.length ? recent.map(h=>`
         <div class="list-row">
-          <div>
-            <b style="font-size:13px">${new Date(h.date).toLocaleDateString('fr-FR',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})}</b>
-            <div class="small">${h.mode==='exam'?'Examen':'Apprentissage'} · ${h.total} Q${h.timeUp?' · temps écoulé':''}</div>
-          </div>
+          <div><b style="font-size:13px">${new Date(h.date).toLocaleDateString('fr-FR',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})}</b><div class="small">${h.mode==='exam'?'Examen':'Apprentissage'} · ${h.total} Q${h.timeUp?' · temps écoulé':''}</div></div>
           <span class="pill ${h.score>=70?'green':h.score>=40?'gold':'red'}">${h.score!==null?h.score+'%':'—'}</span>
         </div>
       `).join('') : '<p class="muted">Aucune séance.</p>'}
@@ -1144,8 +1230,7 @@ function renderStats(){
 function renderSettings(){
   const root = $('#settings');
   root.innerHTML = `
-    <div class="page-title">Réglages</div>
-    <div class="page-sub">Imports, sauvegardes, prompt IA</div>
+    <div class="page-title">Réglages</div><div class="page-sub">Imports, sauvegardes, prompt IA</div>
 
     <div class="card">
       <h3 style="font-size:15px;margin-bottom:10px">📥 Import JSON (coller)</h3>
@@ -1161,15 +1246,24 @@ function renderSettings(){
         <button class="btn btn-outline" onclick="$('#importFile').click()">Importer un fichier .json</button>
         <button class="btn btn-light" onclick="exportBackup()">Sauvegarde complète</button>
         <button class="btn btn-outline" onclick="exportBank()">Exporter la banque</button>
+        <button class="btn btn-outline" onclick="exportAnki()">Export Anki (CSV)</button>
         <button class="btn btn-outline" onclick="exportHistoryCSV()">Historique CSV</button>
       </div>
       <p class="small" style="margin-top:10px">Dernière sauvegarde : <b>${State.config.lastBackupDate ? new Date(State.config.lastBackupDate).toLocaleDateString('fr-FR',{day:'numeric',month:'long',year:'numeric'}) : 'jamais'}</b></p>
     </div>
 
     <div class="card">
+      <h3 style="font-size:15px;margin-bottom:10px">🎯 Objectif quotidien</h3>
+      <div class="form-grid">
+        <div><label class="field">Questions par jour</label><input type="number" id="cfgGoal" min="5" max="200" value="${State.config.dailyGoal || DAILY_GOAL_DEFAULT}"></div>
+        <div style="display:flex;align-items:flex-end"><button class="btn btn-primary btn-block" onclick="saveGoal()">Enregistrer</button></div>
+      </div>
+    </div>
+
+    <div class="card">
       <h3 style="font-size:15px;margin-bottom:10px">🤖 Prompt IA</h3>
       <p class="small" style="margin-bottom:10px">Copie ce prompt, joins ton PDF dans ChatGPT, colle le JSON renvoyé dans la zone ci-dessus.</p>
-      <textarea id="promptText" readonly style="min-height:220px;font-size:12px"></textarea>
+      <textarea id="promptText" readonly style="min-height:260px;font-size:12px"></textarea>
       <div class="actions">
         <button class="btn btn-primary" onclick="copyPrompt()">Copier le prompt</button>
         <button class="btn btn-light" onclick="window.open('https://chatgpt.com/','_blank')">Ouvrir ChatGPT</button>
@@ -1178,14 +1272,13 @@ function renderSettings(){
 
     <div class="card">
       <h3 style="font-size:15px;margin-bottom:10px">📋 Format attendu</h3>
-      <details>
-        <summary>Voir le schéma JSON</summary>
-        <pre>{
+      <details><summary>Voir le schéma JSON</summary><pre>{
   "questions": [{
     "matiere": "Neurologie",
     "cours": "Moelle spinale",
     "section": "Voies sensitives",
     "type": "QCM",
+    "rang": "A",
     "difficulty": "Standard",
     "stem": "Énoncé",
     "opts": ["A", "B", "C", "D", "E"],
@@ -1197,8 +1290,7 @@ function renderSettings(){
     "image": null,
     "statut": "à_vérifier"
   }]
-}</pre>
-      </details>
+}</pre></details>
     </div>
 
     <div class="card" style="border-color:var(--danger)">
@@ -1206,12 +1298,16 @@ function renderSettings(){
       <div class="actions"><button class="btn btn-danger" onclick="resetAll()">Tout effacer</button></div>
     </div>
 
-    <p class="small" style="text-align:center;margin-top:20px">v3.1 · Tes données restent sur cet appareil.</p>`;
+    <p class="small" style="text-align:center;margin-top:20px">v3.4 · Tes données restent sur cet appareil.</p>`;
   $('#promptText').value = buildPrompt();
 }
-
+function saveGoal(){
+  const g = Math.max(5, Math.min(200, Number($('#cfgGoal').value)||DAILY_GOAL_DEFAULT));
+  State.config.dailyGoal = g;
+  saveConfig().then(()=>{ toast('Objectif enregistré','success'); renderHome(); });
+}
 function buildPrompt(){
-  return `Tu es un concepteur de QCM pour étudiant en médecine DFGSM3 (préparation EDN).
+  return `Tu es un concepteur de QCM pour étudiant en médecine DFGSM3 (préparation EDN 2026).
 
 Analyse le PDF joint et crée un sujet STRICTEMENT fondé sur ce document.
 
@@ -1225,6 +1321,12 @@ OBJECTIF
 - Explique pourquoi les propositions fausses sont fausses.
 - Vérifie une seconde fois la cohérence. En cas de doute, retire la question.
 
+RANGS EDN
+- Rang A : connaissance indispensable (doit être sue par tous)
+- Rang B : connaissance discriminante
+- Rang C : hors programme / détail
+Indique le rang de chaque question dans le champ "rang".
+
 FORMAT DE SORTIE (JSON strict, sans Markdown, sans texte autour) :
 {
   "questions": [{
@@ -1232,6 +1334,7 @@ FORMAT DE SORTIE (JSON strict, sans Markdown, sans texte autour) :
     "cours": "Moelle spinale",
     "section": "Voies sensitives",
     "type": "QCM|QRM|QRU|QROC|KFP",
+    "rang": "A|B|C",
     "difficulty": "Facile|Standard|Difficile",
     "stem": "Énoncé",
     "opts": ["Proposition A","B","C","D","E"],
@@ -1254,7 +1357,6 @@ RÈGLES CRITIQUES PAR TYPE
 - "image" : null (ou data URL base64 si indispensable).
 - Le JSON doit être importable directement, sans retouche.`;
 }
-
 function copyPrompt(){
   const ta = $('#promptText');
   ta.select();
@@ -1265,33 +1367,20 @@ function copyPrompt(){
 async function importFromPaste(){
   const raw = $('#pasteJsonArea')?.value.trim();
   if(!raw){ toast('La zone est vide','error'); return; }
-  try {
-    await handleImportedRaw(raw);
-    clearPasteArea();
-  } catch(err){
-    toast('Import impossible : '+err.message,'error');
-    console.error(err);
-  }
+  try { await handleImportedRaw(raw); clearPasteArea(); }
+  catch(err){ toast('Import impossible : '+err.message,'error'); console.error(err); }
 }
 function clearPasteArea(){ const ta = $('#pasteJsonArea'); if(ta) ta.value = ''; }
-
 $('#importFile').addEventListener('change', async e=>{
   const f = e.target.files?.[0];
   if(!f) return;
-  try {
-    const raw = await f.text();
-    await handleImportedRaw(raw);
-  } catch(err){
-    toast('Import impossible : '+err.message,'error');
-    console.error(err);
-  }
+  try { await handleImportedRaw(await f.text()); }
+  catch(err){ toast('Import impossible : '+err.message,'error'); console.error(err); }
   e.target.value = '';
 });
 
 async function handleImportedRaw(rawString){
   const data = parseJSONRobust(rawString);
-
-  // Détection sauvegarde complète
   if(data && !Array.isArray(data) && Array.isArray(data.matieres) && Array.isArray(data.cours) && Array.isArray(data.questions)){
     if(!confirm('Sauvegarde complète détectée. Remplacer les données actuelles ?')) return;
     for(const s of ['matieres','cours','questions','history','meta']) await dbClear(s);
@@ -1300,109 +1389,92 @@ async function handleImportedRaw(rawString){
     for(const q of data.questions) await dbPut('questions', q);
     for(const h of (data.history || [])) await dbPut('history', h);
     if(data.config) await dbPut('meta', { key:'config', value: data.config });
-    await loadAll();
-    toast('Sauvegarde restaurée','success');
-    showView('home');
-    return;
+    await loadAll(); toast('Sauvegarde restaurée','success'); showView('home'); return;
   }
-
-  // Import banque
   const arr = Array.isArray(data) ? data : data.questions;
   if(!Array.isArray(arr)) throw new Error("Le JSON doit contenir 'questions'.");
-  let createdMat = 0, createdCours = 0, imported = 0, skipped = 0;
+  let createdMat = 0, createdCours = 0, imported = 0, skipped = 0, dupes = 0;
+  const existingStems = new Set(State.questions.map(q=>q.stem.toLowerCase().trim()));
   for(const rawQ of arr){
+    const stemNorm = (rawQ.stem||'').toLowerCase().trim();
+    if(stemNorm && existingStems.has(stemNorm)){ dupes++; continue; }
     let matiere;
     if(rawQ.matiere){
       matiere = State.matieres.find(m=>m.nom.toLowerCase()===rawQ.matiere.toLowerCase());
       if(!matiere){
         matiere = { id: uid(), nom: rawQ.matiere, couleur: MATIERE_COLORS[State.matieres.length%MATIERE_COLORS.length], createdAt: Date.now() };
-        await dbPut('matieres', matiere);
-        State.matieres.push(matiere);
-        createdMat++;
+        await dbPut('matieres', matiere); State.matieres.push(matiere); createdMat++;
       }
     } else if(rawQ.coursId && getCours(rawQ.coursId)){
-      const c = getCours(rawQ.coursId);
-      matiere = getMatiere(c.matiereId);
+      matiere = getMatiere(getCours(rawQ.coursId).matiereId);
     }
     if(!matiere){ skipped++; continue; }
-
     let cours;
-    if(rawQ.coursId && getCours(rawQ.coursId)){
-      cours = getCours(rawQ.coursId);
-    } else if(rawQ.cours){
+    if(rawQ.coursId && getCours(rawQ.coursId)){ cours = getCours(rawQ.coursId); }
+    else if(rawQ.cours){
       cours = State.cours.find(c=>c.matiereId===matiere.id && c.nom.toLowerCase()===rawQ.cours.toLowerCase());
       if(!cours){
         cours = { id: uid(), matiereId: matiere.id, nom: rawQ.cours, createdAt: Date.now() };
-        await dbPut('cours', cours);
-        State.cours.push(cours);
-        createdCours++;
+        await dbPut('cours', cours); State.cours.push(cours); createdCours++;
       }
     } else { skipped++; continue; }
-
     const type = (rawQ.type||'QCM').toUpperCase();
     const q = {
-      id: uid(), coursId: cours.id,
-      section: rawQ.section||'',
+      id: uid(), coursId: cours.id, section: rawQ.section||'',
       type: Q_TYPES.includes(type)?type:'QCM',
+      rang: RANGS.includes(rawQ.rang) ? rawQ.rang : null,
       difficulty: rawQ.difficulty||'Standard',
       statut: STATUTS.includes(rawQ.statut)?rawQ.statut:'à_vérifier',
       stem: rawQ.stem||'',
       opts: Array.isArray(rawQ.opts)?rawQ.opts:(Array.isArray(rawQ.options)?rawQ.options:[]),
       ans: Array.isArray(rawQ.ans)?rawQ.ans:(Array.isArray(rawQ.answers)?rawQ.answers:[]),
-      expected: rawQ.expected||'',
-      exp: rawQ.exp||rawQ.explanation||'',
-      source: rawQ.source||'',
-      tags: Array.isArray(rawQ.tags)?rawQ.tags:[],
-      image: rawQ.image||null,
-      box: 0, nextReview: null,
-      attempts: 0, correctAttempts: 0,
-      lastResult: null, lastSeen: null,
-      createdAt: Date.now()
+      expected: rawQ.expected||'', exp: rawQ.exp||rawQ.explanation||'',
+      source: rawQ.source||'', tags: Array.isArray(rawQ.tags)?rawQ.tags:[],
+      image: rawQ.image||null, box: 0, nextReview: null,
+      attempts: 0, correctAttempts: 0, lastResult: null, lastSeen: null, createdAt: Date.now()
     };
     if(q.type==='QRU' && q.ans.length>1) q.ans = [q.ans[0]];
     if(!q.stem){ skipped++; continue; }
-    await dbPut('questions', q);
-    State.questions.push(q);
-    imported++;
+    await dbPut('questions', q); State.questions.push(q); existingStems.add(stemNorm); imported++;
   }
-  toast(`${imported} importée(s)${createdMat?` · ${createdMat} matière(s)`:''}${createdCours?` · ${createdCours} cours`:''}${skipped?` · ${skipped} ignorée(s)`:''}`,'success');
+  toast(`${imported} importée(s)${createdMat?` · ${createdMat} matière(s)`:''}${createdCours?` · ${createdCours} cours`:''}${dupes?` · ${dupes} doublon(s) ignoré(s)`:''}${skipped?` · ${skipped} ignorée(s)`:''}`,'success');
   showView('bank');
 }
 
 /* ============ EXPORT ============ */
 function downloadBlob(blob, name){
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = name; a.click();
+  const a = document.createElement('a'); a.href = url; a.download = name; a.click();
   setTimeout(()=>URL.revokeObjectURL(url), 1000);
 }
 function exportBank(){
   const blob = new Blob([JSON.stringify({
-    version: 3,
-    exportedAt: new Date().toISOString(),
-    matieres: State.matieres,
-    cours: State.cours,
-    questions: State.questions.map(q=>({
-      matiere: getMatiere(getCours(q.coursId)?.matiereId)?.nom,
-      cours: getCours(q.coursId)?.nom,
-      ...q
-    }))
+    version: 3, exportedAt: new Date().toISOString(),
+    matieres: State.matieres, cours: State.cours,
+    questions: State.questions.map(q=>({ matiere: getMatiere(getCours(q.coursId)?.matiereId)?.nom, cours: getCours(q.coursId)?.nom, ...q }))
   }, null, 2)], {type:'application/json'});
   downloadBlob(blob, 'banque-medecine-'+todayStr()+'.json');
 }
 async function exportBackup(){
   const blob = new Blob([JSON.stringify({
-    version: 3,
-    exportedAt: new Date().toISOString(),
-    matieres: State.matieres,
-    cours: State.cours,
-    questions: State.questions,
-    history: State.history,
-    config: State.config
+    version: 3, exportedAt: new Date().toISOString(),
+    matieres: State.matieres, cours: State.cours, questions: State.questions, history: State.history, config: State.config
   }, null, 2)], {type:'application/json'});
   downloadBlob(blob, 'sauvegarde-'+todayStr()+'.json');
-  await updateBackupDate();
-  toast('Sauvegarde exportée','success');
+  await updateBackupDate(); toast('Sauvegarde exportée','success');
+}
+function exportAnki(){
+  const rows = State.questions.map(q=>{
+    const cours = getCours(q.coursId);
+    const mat = cours ? getMatiere(cours.matiereId) : null;
+    const tag = [mat?.nom, cours?.nom, q.section].filter(Boolean).join('::').replace(/[;,]/g,' ');
+    const front = q.stem + (q.opts.length ? '\n\n' + q.opts.map((o,i)=>`${String.fromCharCode(65+i)}. ${o}`).join('\n') : '');
+    const back = (q.type==='QROC'||q.type==='KFP') ? (q.expected||q.exp||'') : `${(q.ans||[]).map(i=>String.fromCharCode(65+i)).join(', ')}\n\n${q.exp||''}`;
+    return [front, back, tag];
+  });
+  const csv = rows.map(r=>r.map(x=>'"'+String(x??'').replace(/"/g,'""')+'"').join(',')).join('\n');
+  downloadBlob(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}), 'anki-export-'+todayStr()+'.csv');
+  toast('Export Anki prêt (importer dans Anki via Fichier → Importer)','success');
 }
 function exportHistoryCSV(){
   const rows = [['date','mode','total','qcm_total','qcm_correct','score','score_exact','duration_s']];
@@ -1414,9 +1486,7 @@ async function resetAll(){
   confirmModal('Tout effacer ?','Toutes les données seront supprimées définitivement.',
     async ()=>{
       for(const s of ['matieres','cours','questions','history','meta']) await dbClear(s);
-      await loadAll();
-      toast('Tout effacé','success');
-      showView('home');
+      await loadAll(); toast('Tout effacé','success'); showView('home');
     }, {danger:true, confirmLabel:'Effacer définitivement'});
 }
 
@@ -1438,15 +1508,10 @@ function toggleOptionByIndex(idx){
   if(['QROC','KFP'].includes(q.type)) return;
   if(idx<0 || idx>=q.opts.length) return;
   const current = s.answers[q.id] || [];
-  if(q.type==='QRU'){
-    s.answers[q.id] = [idx];
-  } else {
-    s.answers[q.id] = current.includes(idx) ? current.filter(x=>x!==idx) : [...current, idx];
-  }
+  if(q.type==='QRU') s.answers[q.id] = [idx];
+  else s.answers[q.id] = current.includes(idx) ? current.filter(x=>x!==idx) : [...current, idx];
   const sel = `[name="ans_${CSS.escape(q.id)}"]`;
-  document.querySelectorAll(sel).forEach(inp=>{
-    inp.checked = (s.answers[q.id] || []).includes(Number(inp.value));
-  });
+  document.querySelectorAll(sel).forEach(inp=>{ inp.checked = (s.answers[q.id] || []).includes(Number(inp.value)); });
 }
 document.addEventListener('keydown', e=>{
   if(isTextTarget(e.target)) return;
@@ -1455,8 +1520,7 @@ document.addEventListener('keydown', e=>{
   const s = State.session;
   if(!s || s.finished) return;
   if(!$('#sessionArea')?.querySelector('.q-card')) return;
-  const key = e.key;
-  const lower = key.toLowerCase();
+  const key = e.key, lower = key.toLowerCase();
   const letterMap = {a:0,b:1,c:2,d:3,e:4};
   if(letterMap[lower]!==undefined){ e.preventDefault(); toggleOptionByIndex(letterMap[lower]); return; }
   const numMap = {'1':0,'2':1,'3':2,'4':3,'5':4};
@@ -1472,7 +1536,24 @@ document.addEventListener('keydown', e=>{
   }
   if(key==='ArrowRight'){ e.preventDefault(); nextQ(); }
   if(key==='ArrowLeft'){ e.preventDefault(); prevQ(); }
+  if(lower==='f' && !e.metaKey && !e.ctrlKey){ e.preventDefault(); toggleFlag(); }
 });
+
+/* Swipe */
+let tx0=0,ty0=0;
+document.addEventListener('touchstart',e=>{tx0=e.touches[0].clientX;ty0=e.touches[0].clientY;},{passive:true});
+document.addEventListener('touchend',e=>{
+  const s=State.session;
+  if(!s||s.finished||!document.body.classList.contains('in-session')||document.querySelector('.modal')||e.target.closest('.qnav,textarea,input'))return;
+  const t=e.changedTouches[0],dx=t.clientX-tx0,dy=t.clientY-ty0;
+  if(Math.abs(dx)>80&&Math.abs(dy)<45)(dx<0?nextQ:prevQ)();
+},{passive:true});
+
+/* Timer warning */
+setInterval(()=>{
+  const s=State.session,t=document.getElementById('timer');
+  if(t&&s&&s.mode==='exam'&&s.remaining>0) t.classList.toggle('warn',s.remaining<300);
+},1000);
 
 /* ============ INIT ============ */
 (async function init(){
@@ -1480,16 +1561,11 @@ document.addEventListener('keydown', e=>{
     db = await openDB();
     await loadAll();
     if(navigator.storage && navigator.storage.persist){
-      try {
-        const ok = await navigator.storage.persist();
-        console.log(ok ? '✅ Stockage persistant accordé' : '⚠ Stockage persistant refusé');
-      } catch(e){}
+      try { const ok = await navigator.storage.persist(); console.log(ok ? '✅ Stockage persistant accordé' : '⚠ Stockage persistant refusé'); } catch(e){}
     }
     renderHome();
     renderBackupBanner();
-    if('serviceWorker' in navigator){
-      navigator.serviceWorker.register('sw.js').catch(()=>{});
-    }
+    if('serviceWorker' in navigator){ navigator.serviceWorker.register('sw.js').catch(()=>{}); }
   } catch(err){
     document.body.innerHTML = `<div style="padding:40px;text-align:center;font-family:sans-serif"><h2>Erreur de démarrage</h2><p>${err.message}</p><p>Vérifie que l'app est ouverte depuis une URL HTTPS.</p></div>`;
     console.error(err);
