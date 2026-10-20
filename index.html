@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d2f55">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Révisions Med">
+<link rel="manifest" href="manifest.json">
+<link rel="stylesheet" href="styles.css">
+<title>Révisions Médecine</title>
+</head>
+<body>
+
+<header class="topbar">
+  <div id="backupBanner" class="backup-banner hidden"></div>
+  <div class="brand">
+    <div class="brand-logo">✚</div>
+    <div class="brand-text">
+      <h1>Révisions Médecine</h1>
+      <p>Préparation personnelle</p>
+    </div>
+  </div>
+  <nav class="tabbar" id="tabbar">
+    <button data-view="home" class="active">Accueil</button>
+    <button data-view="train">Entraînement</button>
+    <button data-view="courses">Cours</button>
+    <button data-view="bank">Banque</button>
+    <button data-view="stats">Stats</button>
+    <button data-view="settings">Réglages</button>
+  </nav>
+</header>
+
+<main id="main">
+  <section id="home" class="view active"></section>
+  <section id="train" class="view"></section>
+  <section id="courses" class="view"></section>
+  <section id="bank" class="view"></section>
+  <section id="stats" class="view"></section>
+  <section id="settings" class="view"></section>
+</main>
+
+<div id="modalRoot"></div>
+<div id="toastRoot"></div>
+<input type="file" id="importFile" accept=".json,application/json" hidden>
+
+<script src="app.js"></script>
+</body>
+</html> 
